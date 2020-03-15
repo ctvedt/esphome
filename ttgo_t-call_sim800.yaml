@@ -1,0 +1,196 @@
+esphome:
+  name: esp32_sim
+  platform: ESP32
+  board: esp-wrover-kit
+
+#IP5306 Custom 
+  includes:
+    - IP5306.h
+
+wifi:
+  ssid: 'SSID'
+  password: 'PASSWORD'
+  # Disble auto reboot
+  reboot_timeout: 0s
+
+logger:
+ota:
+web_server:
+  port: 80
+
+# Home Assistant API
+api:
+  # Disable API-reboot
+  reboot_timeout: 0s
+  # SMS service
+  services:
+  - service: send_sms
+    variables:
+      recipient: string
+      message: string
+    then:
+    - sim800l.send_sms:
+        recipient: !lambda 'return recipient;'
+        message: !lambda 'return message;'
+
+# i2c for onboard IP5306
+i2c:
+  sda: 21
+  scl: 22
+  scan: True
+
+sensor:
+  # IP5306
+  - platform: custom
+    lambda: |-
+      auto battery_sensor = new IP5306();
+      App.register_component(battery_sensor);
+      return {battery_sensor->fully_charged, battery_sensor->battery_level};
+
+    sensors:
+      - name: "esp32_sim_ip5306_fully_charged"
+        accuracy_decimals: 0
+      - name: "esp32_sim_ip5306_battery_sensor"
+        accuracy_decimals: 0
+
+  # Pulse counter for sim led
+  - platform: pulse_counter
+    pin: 12
+    name: "esp32_sim_pulse_counter"
+    id: "esp32_sim_pulse_counter"
+    update_interval: 60s
+
+  # New SMS - Home Assistant Boolean
+  - platform: homeassistant
+    internal: true
+    name: "New SMS"
+    entity_id: input_boolean.sms
+
+  - platform: wifi_signal
+    name: "esp32_sim_wifi"
+    update_interval: 60s
+    
+  - platform: uptime
+    name: "esp32_sim_uptime"
+
+binary_sensor:
+  # Connected to API
+  - platform: status
+    name: "esp32_sim_connected"
+    id: "esp32_sim_connected"
+    filters:
+      - delayed_off: 60s
+                
+text_sensor:
+  - platform: template
+    name: "esp32_sim_status"
+    lambda: |-
+      if (id(esp32_sim_pulse_counter).state >= 18 && id(esp32_sim_pulse_counter).state <= 22) {
+        return {"Registered"};
+      }
+      else if (id(esp32_sim_pulse_counter).state > 22) {
+        return {"Registering"};
+      }
+      else if (id(esp32_sim_pulse_counter).state == 0) {
+        return {"Powered down"};
+      }
+      else {
+        return {"Unknown"};
+      }
+    update_interval: 10s
+    
+  - platform: version
+    name: "esp32_sim_version"
+    
+  - platform: template
+    id: sms_sender
+    name: "esp32_sim_sms_sender"
+    
+  - platform: template
+    id: sms_message
+    name: "esp32_sim_sms_message"
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+# Onboard SIM800L
+# GPIO 27
+# GPIO 26
+uart:
+  baud_rate: 115200
+  tx_pin: 27
+  rx_pin: 26
+
+sim800l:
+  on_sms_received:
+    - logger.log:
+        format: "Received '%s' from %s"
+        args: [ 'message.c_str()', 'sender.c_str()' ]
+    - lambda: |-
+        id(sms_sender).publish_state(sender);
+        id(sms_message).publish_state(message);
+
+    # SMS is a sensor reboot request
+    - if:
+        condition:
+          and:
+            - lambda: 'return id(sms_sender).state == "+47XXXXXXXX";'
+            - lambda: 'return id(sms_message).state == "REBOOT";'
+        then:
+          - sim800l.send_sms:
+              recipient: '+47XXXXXXXX'
+              message: Restarting...
+          - delay: 00:00:20
+          - switch.turn_on: restartswitch
+
+    # Also when receiving SMS
+    - light.turn_on:
+        id: led
+    - homeassistant.service:
+       service: input_boolean.turn_on
+       data:
+        entity_id: input_boolean.sms
+    - delay: 00:00:05
+    - homeassistant.service:
+       service: input_boolean.turn_off
+       data:
+        entity_id: input_boolean.sms
+    - delay: 00:00:55
+    - light.turn_off:
+        id: led
+    
+# Onboard SIM800L GPIO power/reset
+# GPIO 23
+# GPIO 4
+# GPIO 5
+switch:
+  - platform: gpio
+    pin: 23
+    name: "esp32_sim_sim800l_power"
+    restore_mode: ALWAYS_ON
+  - platform: gpio
+    pin: 4
+    name: "SIM800L PWRKEY"
+    restore_mode: ALWAYS_OFF
+    internal: true
+  - platform: gpio
+    pin: 5
+    name: "SIM800L RST"
+    restore_mode: ALWAYS_ON
+    internal: true
+  - platform: restart
+    id: restartswitch
+    name: "esp32_sim_restart"
+
+output:
+  # GPIO 13
+  - platform: ledc
+    pin: 13
+    id: state_led
+
+light:
+  - platform: monochromatic
+    name: "esp32_sim_led"
+    output: state_led
+    id: led
